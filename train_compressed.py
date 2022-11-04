@@ -12,7 +12,7 @@ from coco_utils import get_coco
 from torch import nn
 # from torch.optim.lr_scheduler import PolynomialLR
 from torchvision.transforms import functional as F, InterpolationMode
-import wandb
+
 from torch.optim.lr_scheduler import _LRScheduler
 class PolynomialLR(_LRScheduler):
     """Decays the learning rate of each parameter group using a polynomial function
@@ -172,11 +172,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, devi
         lr_scheduler.step()
 
         metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
-        if utils.is_main_process() and not args.test_only:
-            wandb.log({
-                "loss":loss,
-                "lr":optimizer.param_groups[0]["lr"]
-            })
+
             
 
 
@@ -187,10 +183,6 @@ def main(args):
         utils.mkdir(args.output_dir)
 
     utils.init_distributed_mode(args)
-    if utils.is_main_process() and not args.test_only:
-        wandb.init(project='fcn-resnet50-coco',entity='yuje_lee',name=args.exp_name)
-        wandb.config.update(args)
-        results_dir = os.path.join(args.output_dir,'results.txt')
     print(args)
 
     device = torch.device(args.device)
@@ -224,18 +216,8 @@ def main(args):
         dataset_test, batch_size=1, sampler=test_sampler, num_workers=args.workers, collate_fn=utils.collate_fn
     )
 
-    # model = torchvision.models.get_model(
-    #     args.model,
-    #     weights=args.weights,
-    #     weights_backbone=args.weights_backbone,
-    #     num_classes=num_classes,
-    #     aux_loss=args.aux_loss,
-    # )
-    # model = torchvision.models.segmentation.fcn_resnet50(weights=True, weights_backbone=True, aux_loss=True)
-    # model = torchvision.models.segmentation.fcn_resnet50(weights="FCN_ResNet50_Weights.DEFAULT", aux_loss=True)
+
     model = torch.load(args.pt_model)
-    # model = torch.load('/root/workspace/Original_model/compressed_graphmodule_eval2_L2Norm05.pt')
-    # model = model.eval()
     model.to(device)
     if args.distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -244,15 +226,6 @@ def main(args):
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
-
-        # params_to_optimize = [
-        #     {"params": [p for p in model_without_ddp.backbone.parameters() if p.requires_grad]},
-        #     {"params": [p for p in model_without_ddp.classifier.parameters() if p.requires_grad]},
-        # ]
-        # if args.aux_loss:
-        #     params = [p for p in model_without_ddp.aux_classifier.parameters() if p.requires_grad]
-        #     params_to_optimize.append({"params": params, "lr": args.lr * 10})
-
 
         backbone = []
         classifier = []
@@ -274,8 +247,7 @@ def main(args):
         ]
         if args.aux_loss:
             params_to_optimize.append({"params":aux_classifier, "lr":args.lr*10})
-        # print(params_to_optimize)
-        # print(len(backbone), len(classifier), len(aux_classifier))
+            
     optimizer = torch.optim.SGD(params_to_optimize, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
     scaler = torch.cuda.amp.GradScaler() if args.amp else None
@@ -330,25 +302,8 @@ def main(args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, device, epoch, args.print_freq, scaler)
-        confmat_train = evaluate(model, data_loader, device=device, num_classes=num_classes)
-        train_acc_global, train_acc, train_iu = confmat_train.compute()
+
         confmat = evaluate(model, data_loader_test, device=device, num_classes=num_classes)
-        if utils.is_main_process() and not args.test_only:
-            acc_global, acc, iu = confmat.compute()
-            wandb.log({
-                'acc_global':acc_global,
-                # 'acc':acc,
-                "mean IoU":sum(iu)/len(iu),
-                "train acc_global":train_acc_global,
-                "train mean IoU": sum(train_iu)/len(iu),
-                "step": epoch
-            })
-            now_IoU = sum(iu)/len(iu)
-            with open(results_dir, 'a') as f:
-                f.write(f"Epoch: {epoch}\n")
-                f.write(f"Acc_global: {acc_global}\n")
-                f.write(f"acc:{acc}\n")
-                f.write(f"iu:{iu}\n")
         print(confmat)
         checkpoint = {
             "model": model_without_ddp.state_dict(),
@@ -361,12 +316,6 @@ def main(args):
             checkpoint["scaler"] = scaler.state_dict()
         utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
         utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
-        if utils.is_main_process():
-            torch.save(model_without_ddp,os.path.join(args.output_dir,f"model_{epoch}.pt"))
-            if best_IoU < now_IoU:
-                best_IoU = now_IoU
-                torch.save(model_without_ddp,os.path.join(args.output_dir,f"model_best_E{epoch}_IoU{now_IoU}.pt"))
-                
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
